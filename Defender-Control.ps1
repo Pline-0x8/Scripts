@@ -1,186 +1,131 @@
+param([string]$Action, [string]$Param1, [string]$Param2)
+
+$markerFile = "C:\defender-action.txt"
+
 function Disable-Defender {
-    <#
-    .SYNOPSIS
-    Permanently disables Windows Defender on Windows 11
-    .DESCRIPTION
-    Disables Windows Defender via Group Policy, Registry modifications, and service disabling
-    #>
+    param([string]$SavePath)
 
-    Write-Host "`n[*] Disabling Windows Defender..." -ForegroundColor Yellow
+    Write-Host "`nDisabling Windows Defender..." -ForegroundColor Yellow
 
-    # Check if running as Administrator
-    if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Host "[!] This script must be run as Administrator!" -ForegroundColor Red
-        return $false
+    if (-not (Test-Path $markerFile)) {
+        Write-Host "Setting up Safe Mode boot..." -ForegroundColor Cyan
+        Set-Content -Path $markerFile -Value "disable"
+        if ($SavePath) {
+            Add-Content -Path $markerFile -Value $SavePath
+        }
+        cmd /c "bcdedit /set {current} safeboot minimal" 2>$null | Out-Null
+        Write-Host "Restarting into Safe Mode..." -ForegroundColor Yellow
+        Start-Sleep 2
+        cmd /c "shutdown /r /t 5"
+        exit
     }
 
-    try {
-        # Step 1: Registry modifications for DisableAntiSpyware
-        Write-Host "[+] Setting registry DisableAntiSpyware..." -ForegroundColor Cyan
-        $regPath1 = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender"
-        if (-not (Test-Path $regPath1)) {
-            New-Item -Path $regPath1 -Force | Out-Null
+    Write-Host "Safe Mode active - disabling Defender..." -ForegroundColor Green
+
+    if ($SavePath) {
+        Write-Host "Saving original values to $SavePath..." -ForegroundColor Cyan
+        $backup = @{}
+        $services = @("Sense", "WdBoot", "WdFilter", "WdNisDrv", "WdNisSvc", "WinDefend")
+        foreach ($svc in $services) {
+            $val = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$svc" -Name "Start" -ErrorAction SilentlyContinue).Start
+            $backup["${svc}_Start"] = $val
         }
-        Set-ItemProperty -Path $regPath1 -Name "DisableAntiSpyware" -Value 1 -Force
-
-        # Step 2: Registry modifications for DisableAntiVirus
-        Write-Host "[+] Setting registry DisableAntiVirus..." -ForegroundColor Cyan
-        Set-ItemProperty -Path $regPath1 -Name "DisableAntiVirus" -Value 1 -Force
-
-        # Step 3: Disable Real-Time Protection settings
-        Write-Host "[+] Disabling Real-Time Protection components..." -ForegroundColor Cyan
-        $regPath2 = "HKLM:\SOFTWARE\Microsoft\Windows Defender\Real-Time Protection"
-        if (-not (Test-Path $regPath2)) {
-            New-Item -Path $regPath2 -Force | Out-Null
-        }
-        Set-ItemProperty -Path $regPath2 -Name "DisableBehaviorMonitoring" -Value 1 -Force
-        Set-ItemProperty -Path $regPath2 -Name "DisableIOAVProtection" -Value 1 -Force
-        Set-ItemProperty -Path $regPath2 -Name "DisableOnAccessProtection" -Value 1 -Force
-
-        # Step 4: Disable via MpPreference (if Defender is still active)
-        Write-Host "[+] Disabling via Set-MpPreference..." -ForegroundColor Cyan
-        try {
-            Set-MpPreference -DisableRealtimeMonitoring $true -DisableBehaviorMonitoring $true -ErrorAction SilentlyContinue
-        } catch {
-            Write-Host "[!] Set-MpPreference failed (may already be disabled)" -ForegroundColor Gray
-        }
-
-        # Step 5: Disable Windows Update service to prevent Defender re-enabling
-        Write-Host "[+] Disabling Windows Update service..." -ForegroundColor Cyan
-        Set-Service -Name "WuauServ" -StartupType Disabled -Force -ErrorAction SilentlyContinue
-        Stop-Service -Name "WuauServ" -Force -ErrorAction SilentlyContinue
-
-        Write-Host "[+] Disabling Windows Update Medic service..." -ForegroundColor Cyan
-        Set-Service -Name "WaaSMedicSvc" -StartupType Disabled -Force -ErrorAction SilentlyContinue
-        Stop-Service -Name "WaaSMedicSvc" -Force -ErrorAction SilentlyContinue
-
-        # Verification
-        Write-Host "`n[*] Verifying Defender status..." -ForegroundColor Yellow
-        Start-Sleep -Seconds 2
-
-        try {
-            $mpStatus = Get-MpComputerStatus -ErrorAction SilentlyContinue
-
-            if ($mpStatus) {
-                $defenderEnabled = $mpStatus.AntivirusEnabled
-                $rtpEnabled = $mpStatus.RealTimeProtectionEnabled
-
-                if (-not $defenderEnabled -or -not $rtpEnabled) {
-                    Write-Host "`n[✓] SUCCESS: Windows Defender has been disabled!" -ForegroundColor Green
-                    Write-Host "[✓] Antivirus Enabled: $defenderEnabled" -ForegroundColor Green
-                    Write-Host "[✓] Real-Time Protection Enabled: $rtpEnabled" -ForegroundColor Green
-                    return $true
-                } else {
-                    Write-Host "`n[!] WARNING: Defender still appears to be enabled" -ForegroundColor Yellow
-                    Write-Host "[!] Antivirus Enabled: $defenderEnabled" -ForegroundColor Yellow
-                    Write-Host "[!] Real-Time Protection Enabled: $rtpEnabled" -ForegroundColor Yellow
-                    return $false
-                }
-            }
-        } catch {
-            Write-Host "[!] Could not verify via Get-MpComputerStatus" -ForegroundColor Yellow
-            Write-Host "[*] Registry changes have been applied. Restart may be required for full verification." -ForegroundColor Yellow
-            return $true
-        }
+        $backup | ConvertTo-Json | Out-File -FilePath $SavePath -Encoding UTF8
     }
-    catch {
-        Write-Host "`n[!] ERROR: $($_.Exception.Message)" -ForegroundColor Red
-        return $false
+
+    $services = @("Sense", "WdBoot", "WdFilter", "WdNisDrv", "WdNisSvc", "WinDefend")
+    $policies = @("DisableAntiSpyware", "DisableAntiVirus")
+    $rtpPolicies = @("DisableBehaviorMonitoring", "DisableIOAVProtection", "DisableOnAccessProtection", "DisableRealtimeMonitoring")
+
+    Write-Host "Disabling Defender services..." -ForegroundColor Cyan
+    foreach ($svc in $services) {
+        reg add "HKLM\SYSTEM\CurrentControlSet\Services\$svc" /v Start /t REG_DWORD /d 4 /f 2>$null | Out-Null
     }
+
+    foreach ($policy in $policies) {
+        reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender" /v $policy /t REG_DWORD /d 1 /f 2>$null | Out-Null
+    }
+
+    foreach ($policy in $rtpPolicies) {
+        reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" /v $policy /t REG_DWORD /d 1 /f 2>$null | Out-Null
+    }
+
+    Write-Host "Changes applied. Exiting Safe Mode and rebooting..." -ForegroundColor Green
+    Remove-Item $markerFile -Force -ErrorAction SilentlyContinue
+    cmd /c "bcdedit /deletevalue {current} safeboot" 2>$null | Out-Null
+    Start-Sleep 2
+    cmd /c "shutdown /r /t 5"
 }
 
 function Enable-Defender {
-    <#
-    .SYNOPSIS
-    Re-enables Windows Defender on Windows 11
-    .DESCRIPTION
-    Reverts all changes made by Disable-Defender
-    #>
+    param([string]$ConfigPath)
 
-    Write-Host "`n[*] Enabling Windows Defender..." -ForegroundColor Yellow
+    Write-Host "`nRe-enabling Windows Defender..." -ForegroundColor Yellow
 
-    # Check if running as Administrator
-    if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Host "[!] This script must be run as Administrator!" -ForegroundColor Red
-        return $false
+    if (-not (Test-Path $markerFile)) {
+        Write-Host "Setting up Safe Mode boot..." -ForegroundColor Cyan
+        Set-Content -Path $markerFile -Value "enable"
+        if ($ConfigPath) {
+            Add-Content -Path $markerFile -Value $ConfigPath
+        }
+        cmd /c "bcdedit /set {current} safeboot minimal" 2>$null | Out-Null
+        Write-Host "Restarting into Safe Mode..." -ForegroundColor Yellow
+        Start-Sleep 2
+        cmd /c "shutdown /r /t 5"
+        exit
     }
 
-    try {
-        # Step 1: Remove registry disable settings
-        Write-Host "[+] Removing DisableAntiSpyware registry setting..." -ForegroundColor Cyan
-        $regPath1 = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender"
-        if (Test-Path $regPath1) {
-            Remove-ItemProperty -Path $regPath1 -Name "DisableAntiSpyware" -Force -ErrorAction SilentlyContinue
-        }
+    Write-Host "Safe Mode active - enabling Defender..." -ForegroundColor Green
 
-        Write-Host "[+] Removing DisableAntiVirus registry setting..." -ForegroundColor Cyan
-        if (Test-Path $regPath1) {
-            Remove-ItemProperty -Path $regPath1 -Name "DisableAntiVirus" -Force -ErrorAction SilentlyContinue
-        }
+    $policies = @("DisableAntiSpyware", "DisableAntiVirus")
+    $rtpPolicies = @("DisableBehaviorMonitoring", "DisableIOAVProtection", "DisableOnAccessProtection", "DisableRealtimeMonitoring")
 
-        # Step 2: Reset Real-Time Protection settings
-        Write-Host "[+] Resetting Real-Time Protection settings..." -ForegroundColor Cyan
-        $regPath2 = "HKLM:\SOFTWARE\Microsoft\Windows Defender\Real-Time Protection"
-        if (Test-Path $regPath2) {
-            Remove-ItemProperty -Path $regPath2 -Name "DisableBehaviorMonitoring" -Force -ErrorAction SilentlyContinue
-            Remove-ItemProperty -Path $regPath2 -Name "DisableIOAVProtection" -Force -ErrorAction SilentlyContinue
-            Remove-ItemProperty -Path $regPath2 -Name "DisableOnAccessProtection" -Force -ErrorAction SilentlyContinue
-        }
-
-        # Step 3: Re-enable via MpPreference
-        Write-Host "[+] Re-enabling via Set-MpPreference..." -ForegroundColor Cyan
-        try {
-            Set-MpPreference -DisableRealtimeMonitoring $false -DisableBehaviorMonitoring $false -ErrorAction SilentlyContinue
-        } catch {
-            Write-Host "[!] Set-MpPreference failed (may need restart)" -ForegroundColor Gray
-        }
-
-        # Step 4: Re-enable Windows Update service
-        Write-Host "[+] Re-enabling Windows Update service..." -ForegroundColor Cyan
-        Set-Service -Name "WuauServ" -StartupType Automatic -Force -ErrorAction SilentlyContinue
-        Start-Service -Name "WuauServ" -ErrorAction SilentlyContinue
-
-        Write-Host "[+] Re-enabling Windows Update Medic service..." -ForegroundColor Cyan
-        Set-Service -Name "WaaSMedicSvc" -StartupType Automatic -Force -ErrorAction SilentlyContinue
-        Start-Service -Name "WaaSMedicSvc" -ErrorAction SilentlyContinue
-
-        # Verification
-        Write-Host "`n[*] Verifying Defender status..." -ForegroundColor Yellow
-        Start-Sleep -Seconds 2
-
-        try {
-            $mpStatus = Get-MpComputerStatus -ErrorAction SilentlyContinue
-
-            if ($mpStatus) {
-                $defenderEnabled = $mpStatus.AntivirusEnabled
-                $rtpEnabled = $mpStatus.RealTimeProtectionEnabled
-
-                if ($defenderEnabled -or $rtpEnabled) {
-                    Write-Host "`n[✓] SUCCESS: Windows Defender has been enabled!" -ForegroundColor Green
-                    Write-Host "[✓] Antivirus Enabled: $defenderEnabled" -ForegroundColor Green
-                    Write-Host "[✓] Real-Time Protection Enabled: $rtpEnabled" -ForegroundColor Green
-                    return $true
-                } else {
-                    Write-Host "`n[!] WARNING: Defender may still be disabled" -ForegroundColor Yellow
-                    Write-Host "[!] Antivirus Enabled: $defenderEnabled" -ForegroundColor Yellow
-                    Write-Host "[!] Real-Time Protection Enabled: $rtpEnabled" -ForegroundColor Yellow
-                    Write-Host "[*] Try restarting the system for changes to take full effect" -ForegroundColor Yellow
-                    return $false
-                }
+    if ($ConfigPath -and (Test-Path $ConfigPath)) {
+        Write-Host "Restoring from $ConfigPath..." -ForegroundColor Cyan
+        $backup = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
+        foreach ($property in $backup.PSObject.Properties) {
+            if ($property.Name -like "*_Start") {
+                $svc = $property.Name -replace "_Start", ""
+                reg add "HKLM\SYSTEM\CurrentControlSet\Services\$svc" /v Start /t REG_DWORD /d $property.Value /f 2>$null | Out-Null
             }
-        } catch {
-            Write-Host "[!] Could not verify via Get-MpComputerStatus" -ForegroundColor Yellow
-            Write-Host "[*] Registry changes have been applied. Restart may be required for full verification." -ForegroundColor Yellow
-            return $true
+        }
+    } else {
+        Write-Host "Restoring Windows 11 defaults..." -ForegroundColor Cyan
+        $serviceDefaults = @{ "Sense"=3; "WdBoot"=0; "WdFilter"=0; "WdNisDrv"=4; "WdNisSvc"=4; "WinDefend"=2 }
+        foreach ($svc in $serviceDefaults.Keys) {
+            reg add "HKLM\SYSTEM\CurrentControlSet\Services\$svc" /v Start /t REG_DWORD /d $serviceDefaults[$svc] /f 2>$null | Out-Null
         }
     }
-    catch {
-        Write-Host "`n[!] ERROR: $($_.Exception.Message)" -ForegroundColor Red
-        return $false
+
+    Write-Host "Removing disable policies..." -ForegroundColor Cyan
+    foreach ($policy in $policies) {
+        reg delete "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender" /v $policy /f 2>$null | Out-Null
     }
+
+    foreach ($policy in $rtpPolicies) {
+        reg delete "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" /v $policy /f 2>$null | Out-Null
+    }
+
+    Write-Host "Changes applied. Exiting Safe Mode and rebooting..." -ForegroundColor Green
+    Remove-Item $markerFile -Force -ErrorAction SilentlyContinue
+    cmd /c "bcdedit /deletevalue {current} safeboot" 2>$null | Out-Null
+    Start-Sleep 2
+    cmd /c "shutdown /r /t 5"
 }
 
-Write-Host "`n[+] Defender-Control module loaded successfully!" -ForegroundColor Green
-Write-Host "[+] Available functions:" -ForegroundColor Green
-Write-Host "    - Disable-Defender   : Disable Windows Defender" -ForegroundColor Cyan
-Write-Host "    - Enable-Defender    : Re-enable Windows Defender`n" -ForegroundColor Cyan
+if (Test-Path $markerFile) {
+    $content = Get-Content $markerFile
+    $lines = $content -split "`n"
+    $action = $lines[0].Trim()
+    $path = if ($lines.Count -gt 1) { $lines[1].Trim() } else { $null }
+
+    if ($action -eq "disable") {
+        Disable-Defender -SavePath $path
+    } elseif ($action -eq "enable") {
+        Enable-Defender -ConfigPath $path
+    }
+} else {
+    Write-Host "`nDefender Control - Usage:" -ForegroundColor Cyan
+    Write-Host "  Disable-Defender [--save <path>]" -ForegroundColor Gray
+    Write-Host "  Enable-Defender [--config <path>]`n" -ForegroundColor Gray
+}
